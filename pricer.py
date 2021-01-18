@@ -19,7 +19,7 @@ def get_data(symbol):
     print('%s current price: %f' % (symbol, current_price))
 
     options = []
-    trade_cutoff = datetime.date.today() - datetime.timedelta(7)
+    trade_cutoff = datetime.date.today() - datetime.timedelta(14)
     for date in ticker.options:
         data = ticker.option_chain(date)
         date = datetime.date(*map(int, date.split('-')))
@@ -47,12 +47,12 @@ def get_dates(options):
     return date2i
 
 
-def evaluate(prices, options, date2i):
+def evaluate(current_price, prices, options, date2i):
     loss = 0
     model_values = {}
     real_values = {}
-    largest_profit = 0
     best_options = []
+    cutoff = datetime.date.today() + datetime.timedelta(365)  # keep 1y for long-term capital gain
     for t, date, bid, ask, strike, option_symbol in options:
         i = date2i[date]
         deltas = prices[:,i] - strike
@@ -60,11 +60,10 @@ def evaluate(prices, options, date2i):
         value = numpy.maximum(sign*deltas, 0).mean()
         loss_contribution = numpy.maximum((bid - value)/bid, (value - ask)/ask)**2
         loss += loss_contribution
-        if value > 0:
+        if value > 0 and date > cutoff:
             profit = value / ask - 1
-            if profit > largest_profit:
-                largest_profit = profit
-                best_options.append((profit, option_symbol, ask, value))
+            breakeven = strike + sign*ask  # what prices would have to move to for this option to pay for itself
+            best_options.append((profit, option_symbol, ask, value, breakeven/current_price-1))
         model_values.setdefault(date, []).append(value)
         real_values.setdefault(date, []).append(ask)
 
@@ -74,8 +73,8 @@ def evaluate(prices, options, date2i):
 
 
 def print_best_options(best_options, n=100):
-    for profit, option_symbol, ask, value in sorted(best_options, reverse=True)[:n]:
-        print('%+24.2f%%: %s: ask %9.2f value %9.2f' % (100. * profit, option_symbol, ask, value))
+    for profit, option_symbol, ask, value, breakeven_change in sorted(best_options, reverse=True)[:n]:
+        print('%+24.2f%%: %s: ask %9.2f value %9.2f breakeven change %+9.2f%%' % (100. * profit, option_symbol, ask, value, 100.*breakeven_change))
 
 
 def fit(symbol, current_price, options, alpha, beta, batch_n_paths=400, batch_n_options=400):
@@ -93,7 +92,7 @@ def fit(symbol, current_price, options, alpha, beta, batch_n_paths=400, batch_n_
         return prices
 
     def f(params, rvs, options):
-        return evaluate(get_prices(params, rvs), options, date2i)[0]
+        return evaluate(current_price, get_prices(params, rvs), options, date2i)[0]
 
     jac = autograd.grad(f)
 
@@ -115,19 +114,22 @@ def fit(symbol, current_price, options, alpha, beta, batch_n_paths=400, batch_n_
     print('Generating lots of paths')
     rvs = get_rvs(40000)
     prices = get_prices(params, rvs)
-    loss, model_values, real_values, best_options = evaluate(prices, options, date2i)
+    del rvs # free up memory
+    loss, model_values, real_values, best_options = evaluate(current_price, prices, options, date2i)
     title = '%s: alpha = %f, beta = %f: loss = %f' % (symbol, alpha, beta, loss)
     print_best_options(best_options, 5)
 
-    # Best options if prices start declining by 1 SD annually
+    # Best options if prices start declining by x SDs annually
+    number_sds = 0.5
     print('Annualized volatility:', params[1]*16)
-    daily_extra_drift = -params[1]/16
+    daily_extra_drift = -params[1]/16*number_sds
     print('Adding negative drift:', daily_extra_drift)
     prices_with_decline = prices * numpy.exp(daily_extra_drift * numpy.arange(prices.shape[1]))[None, :]
-    _, _, _, best_options_with_decline = evaluate(prices_with_decline, options, date2i)
+    _, _, _, best_options_with_decline = evaluate(current_price, prices_with_decline, options, date2i)
     print('If prices decline:')
     print_best_options(best_options_with_decline, 5)
 
+    return best_options, best_options_with_decline  # ignore plotting for now
     print('Plotting')
 
     # Plot average price over time
@@ -185,5 +187,5 @@ for symbol in symbols:
 
 print('Best options:')
 print_best_options(all_best_options)
-print('Best options assuming a 1SD decline:')
+print('Best options assuming some decline:')
 print_best_options(all_best_options_with_decline)
