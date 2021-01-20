@@ -1,6 +1,5 @@
 import autograd
 import datetime
-# import numpy
 from autograd import numpy
 from autograd.scipy.special import expit
 import random
@@ -47,19 +46,29 @@ def get_dates(options):
     return date2i
 
 
-def evaluate(current_price, prices, options, date2i):
+def get_payoffs(prices, option_price_indices, option_signs, option_strikes):
+    # Returns a matrix of shape (n_options, n_paths)
+    deltas = prices[:,option_price_indices] - option_strikes
+    payoffs = numpy.maximum(deltas*option_signs, 0).T
+    return payoffs
+
+
+def get_loss(payoffs, options):
     loss = 0
+    values = payoffs.mean(axis=1)
+    for value, (t, date, bid, ask, strike, option_symbol) in zip(values, options):
+        loss += numpy.maximum((bid - value)/bid, (value - ask)/ask)**2
+    return loss / len(options)
+
+
+def get_best_options(payoffs, options):
     model_values = {}
     real_values = {}
     best_options = []
     cutoff = datetime.date.today() + datetime.timedelta(365)  # keep 1y for long-term capital gain
-    for t, date, bid, ask, strike, option_symbol in options:
-        i = date2i[date]
-        deltas = prices[:,i] - strike
+    values = payoffs.mean(axis=1)
+    for value, (t, date, bid, ask, strike, option_symbol) in zip(values, options):
         sign = {'call': 1, 'put': -1}[t]
-        value = numpy.maximum(sign*deltas, 0).mean()
-        loss_contribution = numpy.maximum((bid - value)/bid, (value - ask)/ask)**2
-        loss += loss_contribution
         if value > 0 and date > cutoff:
             profit = value / ask - 1
             breakeven = strike + sign*ask  # what prices would have to move to for this option to pay for itself
@@ -67,9 +76,7 @@ def evaluate(current_price, prices, options, date2i):
         model_values.setdefault(date, []).append(value)
         real_values.setdefault(date, []).append(ask)
 
-    loss /= len(options)
-
-    return loss, model_values, real_values, best_options
+    return model_values, real_values, best_options
 
 
 def print_best_options(best_options, n=100):
@@ -77,9 +84,49 @@ def print_best_options(best_options, n=100):
         print('%+24.2f%%: %s: ask %9.2f value %9.2f breakeven change %+9.2f%%' % (100. * profit, option_symbol, ask, value, 100.*breakeven_change))
 
 
-def fit(symbol, current_price, options, alpha, beta, batch_n_paths=400, batch_n_options=400):
+def optimize_portfolio(payoffs, options, cash=50e3):
+    option_asks = numpy.array([ask for t, date, bid, ask, strike, option_symbol in options])
+
+    def f(portfolio):
+        returns = cash + numpy.dot(portfolio, payoffs) - numpy.dot(portfolio, option_asks)
+        return numpy.log(returns).mean()
+
+    jac = autograd.grad(f)
+    portfolio = numpy.zeros(len(options))
+
+    while True:
+        loss = f(portfolio)
+        grad = jac(portfolio)
+        grad[(grad < 0) & (portfolio == 0)] = 0  # Can't short options
+        best_loss, best_portfolio = loss, portfolio
+        for j in numpy.argsort(numpy.abs(grad))[-10:]:  # consider the 10 entries with largest absolute gradient
+            new_portfolio = portfolio.copy()
+            new_portfolio[j] += 100 * numpy.sign(grad[j])
+            new_loss = f(new_portfolio)
+            if new_loss > best_loss:
+                best_loss, best_portfolio = new_loss, new_portfolio
+        if best_loss <= loss:
+            break
+        loss, portfolio = best_loss, best_portfolio
+
+    print('risk-adjusted expected outcome:', numpy.exp(loss))
+    for p, (t, date, bid, ask, strike, option_symbol) in zip(portfolio, options):
+        if p > 0:
+            print(p, option_symbol, 'ask', ask)
+
+
+def fit(symbol, current_price, options, alpha, beta, batch_n_paths=1000):
     print('fit(alpha=%f, beta=%f)' % (alpha, beta))
     date2i = get_dates(options)
+
+    # Prepare some arrays so we can vectorize
+    option_price_indices = []
+    option_signs = []
+    option_strikes = []
+    for j, (t, date, bid, ask, strike, option_symbol) in enumerate(options):
+        option_price_indices.append(date2i[date])
+        option_strikes.append(strike)
+        option_signs.append({'call': 1, 'put': -1}[t])
 
     def get_rvs(n_paths):
         return scipy.stats.levy_stable.rvs(alpha, beta, size=(n_paths, len(date2i)))
@@ -91,8 +138,11 @@ def fit(symbol, current_price, options, alpha, beta, batch_n_paths=400, batch_n_
         prices = current_price * numpy.exp(log_paths)
         return prices
 
-    def f(params, rvs, options):
-        return evaluate(current_price, get_prices(params, rvs), options, date2i)[0]
+    def f(params, rvs):
+        prices = get_prices(params, rvs)
+        payoffs = get_payoffs(prices, option_price_indices, option_signs, option_strikes)
+        loss = get_loss(payoffs, options)
+        return loss
 
     jac = autograd.grad(f)
 
@@ -100,36 +150,44 @@ def fit(symbol, current_price, options, alpha, beta, batch_n_paths=400, batch_n_
     step_size = 1e-2
     params = numpy.array([-0.001, 0.033])
     adagrad_sum = 0.0
-    for step in range(500):
+    for step in range(100):
         rvs = get_rvs(batch_n_paths)
-        options_sample = random.sample(options, min(len(options), batch_n_options))
-
         loc, scale = params
-        # print('%6d %12.6f %12.6f -> %24.6f' % (step, loc, scale, f(params, rvs, options_sample)))
-        grad = jac(params, rvs, options_sample)
-        adagrad_sum = adagrad_sum * 0.98 + numpy.dot(grad, grad)
+        print('%6d %12.6f %12.6f -> %24.6f' % (step, loc, scale, f(params, rvs)))
+        grad = jac(params, rvs)
+        adagrad_sum = adagrad_sum * 0.85 + numpy.dot(grad, grad)
         params -= step_size * grad / adagrad_sum**0.5
-        step_size *= 0.99
+        step_size *= 0.95
 
     print('Generating lots of paths')
     rvs = get_rvs(40000)
     prices = get_prices(params, rvs)
     del rvs # free up memory
-    loss, model_values, real_values, best_options = evaluate(current_price, prices, options, date2i)
+    payoffs = get_payoffs(prices, option_price_indices, option_signs, option_strikes)
+    loss = get_loss(payoffs, options)
+    model_values, real_values, best_options = get_best_options(payoffs, options)
     title = '%s: alpha = %f, beta = %f: loss = %f' % (symbol, alpha, beta, loss)
     print_best_options(best_options, 5)
 
     # Best options if prices start declining by x SDs annually
-    number_sds = 0.5
+    number_sds = 1.0
     print('Annualized volatility:', params[1]*16)
     daily_extra_drift = -params[1]/16*number_sds
     print('Adding negative drift:', daily_extra_drift)
     prices_with_decline = prices * numpy.exp(daily_extra_drift * numpy.arange(prices.shape[1]))[None, :]
-    _, _, _, best_options_with_decline = evaluate(current_price, prices_with_decline, options, date2i)
+    payoffs_with_decline = get_payoffs(prices_with_decline, option_price_indices, option_signs, option_strikes)
+    _, _, best_options_with_decline = get_best_options(payoffs_with_decline, options)
     print('If prices decline:')
     print_best_options(best_options_with_decline, 5)
 
-    return best_options, best_options_with_decline  # ignore plotting for now
+    # Find best combination of options
+    print('best portfolio:')
+    optimize_portfolio(payoffs, options)
+
+    print('best portfolio if prices decline:')
+    optimize_portfolio(payoffs_with_decline, options)
+
+    # return best_options, best_options_with_decline  # ignore plotting for now
     print('Plotting')
 
     # Plot average price over time
@@ -145,7 +203,7 @@ def fit(symbol, current_price, options, alpha, beta, batch_n_paths=400, batch_n_
     pyplot.savefig('%s_avg_%.2f_%.2f.png' % (symbol, alpha, beta))
 
     # Plot distribution
-    unique_strikes = sorted(date for _, date, _, _, _, _ in options)
+    unique_strikes = sorted(set(date for _, date, _, _, _, _ in options))
     colors = pyplot.cm.viridis(numpy.linspace(0, 1, len(unique_strikes)))
     pyplot.clf()
     for date, color in zip(unique_strikes, colors):
@@ -161,6 +219,7 @@ def fit(symbol, current_price, options, alpha, beta, batch_n_paths=400, batch_n_
     pyplot.clf()
     pyplot.plot([1e-2, 1e3], [1e-2, 1e3])
     for date, color in zip(unique_strikes, colors):
+        print('plotting', date)
         pyplot.scatter(real_values[date], model_values[date], label=date, color=color, alpha=0.2)
     pyplot.legend()
     pyplot.xlabel('Real ask price')
@@ -180,7 +239,7 @@ for symbol in symbols:
     current_price, options = get_data(symbol)
     # 0 < alpha <= 2 is the stability. normal distribution = 2, cauchy = 1
     # -1 <= beta <= 1 is skewness. we constrain it to non-positive values
-    alpha, beta = 1.9, -0.95  # Looking at different stocks, this seems to fit the data reasonably well
+    alpha, beta = 1.90, -0.95  # Looking at different stocks, this seems to fit the data reasonably well
     best_options, best_options_with_decline = fit(symbol, current_price, options, alpha, beta)
     all_best_options += best_options
     all_best_options_with_decline += best_options_with_decline
